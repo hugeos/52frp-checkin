@@ -1,4 +1,6 @@
 // Cloudflare Worker 入口：随机时间签到 + 手动触发
+// 支持多站点：52frp.com + 88frp.com
+//
 // - scheduled: Cron 每 15 分钟触发，每天在随机时间点执行一次签到
 // - fetch:     GET /run 手动触发（可选用 ACCESS_KEY 保护），不受随机限制
 //
@@ -8,8 +10,14 @@
 //   基于当天日期算出一个稳定的伪随机"幸运时间槽"，
 //   只有命中的那次才真正签到，其余跳过。
 //   每天签到时间在北京时间 8:00-22:45 之间随机，且每天不同。
+//
+// 多站点配置：
+//   52frp: FRP_USERNAME / FRP_PASSWORD
+//   88frp: FRP88_USERNAME / FRP88_PASSWORD
+//   未配置某站点的账号密码时自动跳过该站点
 
 import { runCheckIn, sendPushPlus } from './lib.js';
+import { runCheckIn88 } from './frp88.js';
 
 // ---------- 随机时间槽 ----------
 
@@ -46,16 +54,16 @@ function slotToBeijingTime(slot) {
 
 // ---------- 签到执行 ----------
 
-async function handleCheckin(env) {
+// 单站点签到封装
+async function checkinSite(name, checkinFn, env) {
   const start = Date.now();
   let result;
   try {
-    result = await runCheckIn(env);
+    result = await checkinFn(env);
   } catch (err) {
     result = { status: 'error', message: err.message };
   }
   const elapsed = ((Date.now() - start) / 1000).toFixed(1);
-
   const emoji =
     result.status === 'success' ? '✅' : result.status === 'already_signed' ? '☑️' : '❌';
   const label =
@@ -64,17 +72,61 @@ async function handleCheckin(env) {
       : result.status === 'already_signed'
         ? '今日已签'
         : '签到失败';
-  const fullMessage = `【52frp签到】${emoji}${label}\n${result.message}\n耗时 ${elapsed}s`;
-  console.log(fullMessage);
+  return {
+    site: name,
+    ...result,
+    elapsed: elapsed + 's',
+    line: `【${name}】${emoji}${label}\n${result.message}\n耗时 ${elapsed}s`,
+  };
+}
+
+async function handleCheckin(env) {
+  const tasks = [];
+
+  // 52frp（配置了 FRP_USERNAME 才执行）
+  if (env.FRP_USERNAME) {
+    tasks.push(checkinSite('52frp', runCheckIn, env));
+  }
+
+  // 88frp（配置了 FRP88_USERNAME 才执行）
+  if (env.FRP88_USERNAME) {
+    tasks.push(checkinSite('88frp', runCheckIn88, env));
+  }
+
+  if (tasks.length === 0) {
+    return {
+      status: 'error',
+      message: '未配置任何签到账号。需要设置 FRP_USERNAME/FRP_PASSWORD（52frp）或 FRP88_USERNAME/FRP88_PASSWORD（88frp）',
+      results: [],
+    };
+  }
+
+  // 并行签到所有站点
+  const results = await Promise.all(tasks);
+
+  // 汇总推送
+  const summary = results.map((r) => r.line).join('\n\n');
+  const hasError = results.some((r) => r.status === 'error');
+  const title = hasError ? '签到提醒（有失败）' : '签到完成';
+  console.log(summary);
 
   let pushResult = '';
   try {
-    pushResult = await sendPushPlus(env, '52frp签到', fullMessage);
+    pushResult = await sendPushPlus(env, title, summary);
   } catch (e) {
-    pushResult = `推送失败: ${e.message}`;
+    pushResult = '推送失败: ' + e.message;
   }
 
-  return { ...result, elapsed: `${elapsed}s`, push: pushResult };
+  return {
+    status: hasError ? 'partial' : 'success',
+    results: results.map((r) => ({
+      site: r.site,
+      status: r.status,
+      message: r.message,
+      elapsed: r.elapsed,
+    })),
+    push: pushResult,
+  };
 }
 
 // ---------- Worker 入口 ----------
@@ -114,7 +166,6 @@ export default {
       const now = new Date();
       const luckySlot = getTodayLuckySlot(now);
       const result = await handleCheckin(env);
-      // 附带今日幸运时间信息，方便排查
       result.luckyTime = slotToBeijingTime(luckySlot);
       return new Response(JSON.stringify(result, null, 2), {
         headers: { 'Content-Type': 'application/json; charset=utf-8' },
@@ -136,8 +187,9 @@ export default {
     }
 
     return new Response(
-      '52frp 自动签到 Worker\n' +
-      'GET /run   手动触发签到\n' +
+      'FRP 自动签到 Worker\n' +
+      '支持站点: 52frp.com / 88frp.com\n\n' +
+      'GET /run   手动触发签到（签到所有已配置站点）\n' +
       'GET /lucky 查看今日随机幸运时间\n',
       { headers: { 'Content-Type': 'text/plain; charset=utf-8' } }
     );
