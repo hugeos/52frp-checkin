@@ -1,0 +1,5 @@
+# 复制为 .dev.vars 后填写（仅本地 wrangler dev 使用，切勿提交到 git）
+FRP_USERNAME=你的52frp账号
+FRP_PASSWORD=你的52frp密码
+PUSHPLUS_TOKEN=你的PushPlus_token（可选）
+ACCESS_KEY=自定义访问密钥（可选，保护 /run 接口）

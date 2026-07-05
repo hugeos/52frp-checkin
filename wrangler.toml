@@ -1,0 +1,15 @@
+name = "52frp-checkin"
+main = "src/index.js"
+compatibility_date = "2024-11-01"
+
+# 定时触发：Cloudflare Cron 使用 UTC 时间
+# UTC 01:15 = 北京时间 09:15，每天执行一次
+# 如需改时间，修改下方 cron 表达式（分 时 * * *）
+[triggers]
+crons = ["15 1 * * *"]
+
+# 敏感信息请用 wrangler secret 配置，不要写在这里：
+#   wrangler secret put FRP_USERNAME
+#   wrangler secret put FRP_PASSWORD
+#   wrangler secret put PUSHPLUS_TOKEN      (可选)
+#   wrangler secret put ACCESS_KEY          (可选，保护 /run 接口)

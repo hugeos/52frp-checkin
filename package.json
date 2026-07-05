@@ -1,0 +1,15 @@
+{
+  "name": "52frp-checkin",
+  "version": "1.0.0",
+  "type": "module",
+  "private": true,
+  "description": "基于 Cloudflare Worker 的 52frp 每日自动签到（纯 API + PushPlus 微信推送）",
+  "scripts": {
+    "test": "node test-local.js",
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "wrangler": "^3.90.0"
+  }
+}
