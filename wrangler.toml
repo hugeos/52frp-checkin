@@ -3,10 +3,11 @@ main = "src/index.js"
 compatibility_date = "2024-11-01"
 
 # 定时触发：Cloudflare Cron 使用 UTC 时间
-# UTC 01:15 = 北京时间 09:15，每天执行一次
-# 如需改时间，修改下方 cron 表达式（分 时 * * *）
+# 每 15 分钟触发一次，代码内部根据日期算出当天随机幸运时间点，只有命中时才签到
+# 每天签到时间在北京时间 8:00-22:45 之间随机，每天不同
+# 免费版每天 96 次触发，远低于 10 万次/天的额度
 [triggers]
-crons = ["15 1 * * *"]
+crons = ["0,15,30,45 * * * *"]
 
 # 敏感信息请用 wrangler secret 配置，不要写在这里：
 #   wrangler secret put FRP_USERNAME

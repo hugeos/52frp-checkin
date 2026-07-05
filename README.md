@@ -84,8 +84,9 @@ $env:FRP_USERNAME='你的账号'; $env:FRP_PASSWORD='你的密码'; node test-lo
    | `FRP_PASSWORD` | 你的 52frp 密码 | Secret |
    | `PUSHPLUS_TOKEN` | PushPlus token（可选） | Secret |
    | `ACCESS_KEY` | 自定义密钥，保护 /run 接口（可选） | Secret |
-6. Cron 定时触发器已在 `wrangler.toml` 里配好（`15 1 * * *` = 北京时间 09:15），部署后自动生效，无需手动添加
+6. Cron 定时触发器已在 `wrangler.toml` 里配好（每 15 分钟触发，代码内部随机命中），部署后自动生效，无需手动添加
 7. 验证：浏览器访问 `https://52frp-checkin.<你的子域>.workers.dev/run`（若设了 ACCESS_KEY，则访问 `/run?key=你的密钥`），返回 JSON 里 `status` 为 `success` 或 `already_signed` 即成功，微信也会收到推送
+8. 查看今日随机幸运时间：访问 `https://52frp-checkin.<你的子域>.workers.dev/lucky`
 
 > 以后每次 push 到 `main` 分支，Cloudflare 都会自动重新部署，改完代码推上去即可，无需手动操作。
 
@@ -114,7 +115,20 @@ https://52frp-checkin.<你的子域>.workers.dev/run
 
 返回 JSON 里 `status` 为 `success` 或 `already_signed` 即成功，微信也会收到推送。
 
-之后每天北京时间 **09:15** 自动执行一次。想改时间，修改 `wrangler.toml` 里的 cron 表达式（UTC 时间，北京时间 = UTC + 8）。
+之后**每天在北京时间 8:00-22:45 之间的一个随机时间点自动签到一次**，每天的时间不同。
+
+### 随机时间机制
+
+为什么不固定时间？固定时间签到容易被识别为自动化行为。本方案采用**多频触发 + 随机命中**：
+
+- Cron 每 15 分钟触发一次 Worker（每天 96 次）
+- 代码内部根据当天日期算出一个稳定的伪随机"幸运时间槽"
+- 只有命中的那次才真正执行签到，其余直接跳过（几乎不消耗额度）
+- 每天签到时间在北京时间 8:00-22:45 之间随机，且每天不同
+- 手动访问 `/run` 不受随机限制，随时可触发
+- 访问 `/lucky` 可查看今天的幸运时间
+
+> 免费版 Worker 每天 10 万次请求额度，96 次触发完全无压力。
 
 ## 文件说明
 
