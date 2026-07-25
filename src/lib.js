@@ -174,8 +174,13 @@ function createApiClient() {
   async function request(method, path, { body, headers } = {}) {
     const init = { method, headers: buildHeaders(headers) };
     if (body !== undefined) {
-      init.headers['Content-Type'] = 'application/json';
-      init.body = JSON.stringify(body);
+      if (typeof body === 'string') {
+        // 已经是 URL-encoded 字符串，直接使用
+        init.body = body;
+      } else {
+        init.headers['Content-Type'] = 'application/json';
+        init.body = JSON.stringify(body);
+      }
     }
     const res = await fetch(`${BASE_URL}/${String(path).replace(/^\/+/, '')}`, init);
     storeCookies(res.headers);
@@ -192,6 +197,30 @@ function createApiClient() {
       throw new Error(extractMessage(payload, `请求失败 (${res.status})`));
     }
     return payload;
+  }
+
+  // 带重试的请求（用于签到提交，参考 frp88.js 的健壮性设计）
+  async function requestWithRetry(method, path, opts, maxRetries = 3) {
+    let lastError;
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        return await request(method, path, opts);
+      } catch (err) {
+        lastError = err;
+        const msg = err.message || '';
+        // 5xx 错误才重试，4xx 错误不重试
+        if (msg.includes('500') || msg.includes('502') || msg.includes('503') || msg.includes('504')) {
+          if (attempt < maxRetries) {
+            const delay = 1500 * attempt;
+            console.log(`[52frp] 请求失败 (${msg})，${delay}ms 后重试 (${attempt}/${maxRetries})`);
+            await new Promise(r => setTimeout(r, delay));
+          }
+        } else {
+          throw err;
+        }
+      }
+    }
+    throw lastError;
   }
 
   async function primeSession() {
@@ -218,7 +247,16 @@ function createApiClient() {
       return request('GET', 'user/slider-token');
     },
     signIn(sliderToken) {
-      return request('POST', 'user/sign', { body: { slider_token: sliderToken } });
+      // 52frp 前端使用 application/x-www-form-urlencoded 格式，
+      // 且需要附带 csrf_token（即 JWT token）
+      const body = new URLSearchParams({
+        slider_token: sliderToken,
+        csrf_token: token.value,
+      }).toString();
+      return requestWithRetry('POST', 'user/sign', {
+        body,
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      });
     },
     getUserInfo() {
       return request('GET', 'user/info');
