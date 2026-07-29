@@ -14,3 +14,8 @@ crons = ["0,15,30,45 * * * *"]
 #   wrangler secret put FRP_PASSWORD
 #   wrangler secret put PUSHPLUS_TOKEN      (可选)
 #   wrangler secret put ACCESS_KEY          (可选，保护 /run 接口)
+
+# KV 命名空间：存储每日签到状态（去重 + 失败重试上限，防止触发"签到次数超限"）
+[[kv_namespaces]]
+binding = "SIGN_STATE"
+id = "9c64fc78c25a4d3a98668a3fe694a4a9"
