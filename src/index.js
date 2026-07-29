@@ -107,14 +107,19 @@ async function handleCheckin(env) {
   // 汇总推送
   const summary = results.map((r) => r.line).join('\n\n');
   const hasError = results.some((r) => r.status === 'error');
+  const hasSuccess = results.some((r) => r.status === 'success');
+  // 仅当「有新签到成功」或「有失败」时才推送，避免每 15 分钟重复刷"今日已签"通知
+  const shouldPush = hasError || hasSuccess;
   const title = hasError ? '签到提醒（有失败）' : '签到完成';
   console.log(summary);
 
-  let pushResult = '';
-  try {
-    pushResult = await sendPushPlus(env, title, summary);
-  } catch (e) {
-    pushResult = '推送失败: ' + e.message;
+  let pushResult = '本次无新签到（今日已签或无需操作），跳过推送';
+  if (shouldPush) {
+    try {
+      pushResult = await sendPushPlus(env, title, summary);
+    } catch (e) {
+      pushResult = '推送失败: ' + e.message;
+    }
   }
 
   return {
@@ -132,13 +137,20 @@ async function handleCheckin(env) {
 // ---------- Worker 入口 ----------
 
 export default {
-  // 定时触发：每 15 分钟一次，只在当天随机幸运时间点执行
+  // 定时触发：每 15 分钟一次
+  // 随机时间原理（改进版，更稳健）：
+  //   - 基于当天日期算出"幸运时间槽"luckySlot（北京时间 8:00-22:45 内随机，每天不同）
+  //   - 当前时间槽 currentSlot 还没到 luckySlot → 跳过（保证"随机时间点"特性）
+  //   - currentSlot 到达并超过 luckySlot（且仍在 8:00-22:45 窗口内）→ 尝试签到
+  //   - 若当天已签到，runCheckIn 内部会识别 already_signed 直接返回，不会重复签到
+  //   - 若某次网络抖动失败，下一个 15 分钟槽会再次尝试，直到当天签上为至（自动重试）
   async scheduled(controller, env, ctx) {
     const now = new Date();
     const luckySlot = getTodayLuckySlot(now);
     const currentSlot = getCurrentSlot(now);
 
-    if (currentSlot !== luckySlot) {
+    // 未到幸运时间，或超出当日窗口（北京时间 23:00-次日07:45）→ 跳过
+    if (currentSlot < luckySlot || currentSlot > 59) {
       console.log(
         `[skip] 今日幸运时间 ${slotToBeijingTime(luckySlot)}（北京），` +
         `当前 ${slotToBeijingTime(currentSlot)}，跳过`
@@ -146,7 +158,7 @@ export default {
       return;
     }
 
-    console.log(`[hit] 命中今日幸运时间 ${slotToBeijingTime(luckySlot)}（北京），开始签到`);
+    console.log(`[run] 已进入今日幸运时间窗口 ${slotToBeijingTime(luckySlot)}（北京），尝试签到`);
     ctx.waitUntil(handleCheckin(env));
   },
 
