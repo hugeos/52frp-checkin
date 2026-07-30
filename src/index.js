@@ -79,9 +79,19 @@ async function checkinSite(name, checkinFn, env, beijingDate) {
   const signedKey = `signed:${name}:${beijingDate}`;
   const attemptKey = `attempts:${name}:${beijingDate}`;
 
-  // 1) 已签到（KV 记录）→ 直接跳过，绝不再调接口
+  // 1) 已签到 / 已被服务端锁定（KV 记录）→ 直接跳过，绝不再调接口
   if (kv) {
     const done = await kv.get(signedKey);
+    if (done === 'blocked') {
+      return {
+        site: name,
+        status: 'error',
+        message: '今日账号已被服务端锁定（签到次数超限），明日自动再试',
+        elapsed: '0s',
+        line: `【${name}】🔒今日已被锁定（服务端超限）`,
+        noPush: true,
+      };
+    }
     if (done) {
       return {
         site: name,
@@ -119,6 +129,15 @@ async function checkinSite(name, checkinFn, env, beijingDate) {
   // 成功后写 KV，确保当天不再重复调用接口
   if (kv && result.status === 'success') {
     await kv.put(signedKey, '1', { expirationTtl: 172800 });
+  }
+
+  // 明确被服务端锁定（签到次数超限）→ 当天彻底放弃，不再重试、不推送
+  const blocked =
+    result.status === 'error' &&
+    /已达上限|次数超限|明天再试|limit/i.test(result.message || '');
+  if (kv && blocked) {
+    await kv.put(signedKey, 'blocked', { expirationTtl: 172800 });
+    result.noPush = true;
   }
 
   const emoji =
