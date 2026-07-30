@@ -130,9 +130,11 @@ function isAlreadySigned(data, status) {
  * 执行一次 88frp 签到。env 需包含 FRP88_USERNAME / FRP88_PASSWORD。
  * 返回 { status: 'success' | 'already_signed' | 'error', message, details }
  */
-export async function runCheckIn88(env) {
-  if (!env.FRP88_USERNAME || !env.FRP88_PASSWORD) {
-    throw new Error('缺少 FRP88_USERNAME / FRP88_PASSWORD');
+export async function runCheckIn88(env, creds = null) {
+  const username = creds?.username || env.FRP88_USERNAME;
+  const password = creds?.password || env.FRP88_PASSWORD;
+  if (!username || !password) {
+    throw new Error('缺少 88frp 账号密码');
   }
 
   const authHeaders = {
@@ -147,7 +149,7 @@ export async function runCheckIn88(env) {
   const loginRes = await request88('/api/auth/login', {
     method: 'POST',
     headers: authHeaders,
-    body: JSON.stringify({ username: env.FRP88_USERNAME, password: env.FRP88_PASSWORD }),
+    body: JSON.stringify({ username, password }),
   });
 
   const loginData = loginRes.data;

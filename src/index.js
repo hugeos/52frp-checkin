@@ -12,8 +12,9 @@
 //   每天签到时间在北京时间 8:00-22:45 之间随机，且每天不同。
 //
 // 多站点配置：
-//   52frp: FRP_USERNAME / FRP_PASSWORD
-//   88frp: FRP88_USERNAME / FRP88_PASSWORD
+//   52frp: FRP_USERNAME / FRP_PASSWORD（单个）
+//   88frp: FRP88_USERNAME / FRP88_PASSWORD（主账号）
+//          + 附加账号 FRP88_USERNAME_2 / FRP88_PASSWORD_2、FRP88_USERNAME_3 / FRP88_PASSWORD_3 …（最多 _20）
 //   未配置某站点的账号密码时自动跳过该站点
 
 import { runCheckIn, sendPushPlus } from './lib.js';
@@ -131,6 +132,11 @@ async function checkinSite(name, checkinFn, env, beijingDate) {
     await kv.put(signedKey, '1', { expirationTtl: 172800 });
   }
 
+  // 已签（今日已被签，含手动/别处签）也写本地记录，避免每次轮询都消耗"失败重试次数"额度
+  if (kv && result.status === 'already_signed') {
+    await kv.put(signedKey, '1', { expirationTtl: 172800 });
+  }
+
   // 明确被服务端锁定（签到次数超限）→ 当天彻底放弃，不再重试、不推送
   const blocked =
     result.status === 'error' &&
@@ -164,9 +170,19 @@ async function handleCheckin(env, beijingDate) {
     tasks.push(checkinSite('52frp', runCheckIn, env, beijingDate));
   }
 
-  // 88frp（配置了 FRP88_USERNAME 才执行）
-  if (env.FRP88_USERNAME) {
-    tasks.push(checkinSite('88frp', runCheckIn88, env, beijingDate));
+  // 88frp（主账号 FRP88_USERNAME/FRP88_PASSWORD + 附加账号 FRP88_USERNAME_2/_3…）
+  const frp88Accounts = [];
+  const push88 = (name, username, password) => {
+    if (username && password) frp88Accounts.push({ name, username, password });
+  };
+  push88('88frp', env.FRP88_USERNAME, env.FRP88_PASSWORD);
+  for (let i = 2; i <= 20; i++) {
+    push88(`88frp-${i}`, env[`FRP88_USERNAME_${i}`], env[`FRP88_PASSWORD_${i}`]);
+  }
+  for (const acc of frp88Accounts) {
+    tasks.push(
+      checkinSite(acc.name, (e) => runCheckIn88(e, { username: acc.username, password: acc.password }), env, beijingDate)
+    );
   }
 
   if (tasks.length === 0) {
