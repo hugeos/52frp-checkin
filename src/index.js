@@ -1,384 +1,229 @@
-// Cloudflare Worker 入口：随机时间签到 + 手动触发
-// 支持多站点：52frp.com + 88frp.com
-//
-// - scheduled: Cron 每 15 分钟触发，每天在随机时间点执行一次签到
-// - fetch:     GET /run 手动触发（可选用 ACCESS_KEY 保护），不受随机限制
-//
-// 随机时间原理：
-//   Cloudflare Worker 有墙钟时间限制（约 10s），无法长时间 sleep。
-//   改用"多频触发 + 随机命中"：Cron 每 15 分钟触发一次，
-//   基于当天日期算出一个稳定的伪随机"幸运时间槽"，
-//   只有命中的那次才真正签到，其余跳过。
-//   每天签到时间在北京时间 8:00-22:45 之间随机，且每天不同。
-//
-// 多站点配置：
-//   52frp: FRP_USERNAME / FRP_PASSWORD（单个）
-//   88frp: FRP88_USERNAME / FRP88_PASSWORD（主账号）
-//          + 附加账号 FRP88_USERNAME_2 / FRP88_PASSWORD_2、FRP88_USERNAME_3 / FRP88_PASSWORD_3 …（最多 _20）
-//   未配置某站点的账号密码时自动跳过该站点
+// 52frp + 88frp 自动签到 Worker
+// 每天北京时间 8:00-20:00 内随机时间签到一次
+// 失败后 30 分钟重试一次，再失败则放弃（用户会人工签到）
 
-import { runCheckIn, sendPushPlus, getStatus52, probeSign52 } from './lib.js';
+import { runCheckIn, sendPushPlus } from './lib.js';
 import { runCheckIn88 } from './frp88.js';
 
-// ---------- 北京时间 & 随机时间槽 ----------
-// 关键：Cloudflare Worker 运行时为 UTC。所有时间判断统一转换为北京时间（UTC+8），
-// 避免"服务器时区不对导致半夜签到"的问题。
+// ========== 北京时间 ==========
 
-function getBeijingNow() {
-  // 在 UTC 时刻基础上 +8 小时得到北京时间；toISOString() 取日期、getUTCHours() 取小时
+function beijingNow() {
   return new Date(Date.now() + 8 * 3600 * 1000);
 }
 
-function beijingDateStr(d) {
-  return d.toISOString().slice(0, 10); // 已是 +8 后的日期
+function todayStr(d) {
+  return d.toISOString().slice(0, 10);
 }
 
-// 签到窗口：北京时间 08:00 - 22:45
-const WINDOW_START_MIN = 8 * 60;       // 480
-const WINDOW_END_MIN = 22 * 60 + 45;   // 1365
-const SLOT_MINUTES = 15;
-const WINDOW_SLOTS = Math.floor((WINDOW_END_MIN - WINDOW_START_MIN) / SLOT_MINUTES) + 1; // 60
-
-// FNV-1a 哈希：同一日期字符串 → 同一数值（稳定），不同日期 → 不同数值
-function dailyHash(dateStr) {
-  let hash = 2166136261;
-  for (const c of dateStr) {
-    hash ^= c.charCodeAt(0);
-    hash = Math.imul(hash, 16777619);
-  }
-  return hash >>> 0;
+function timeMin(d) {
+  return d.getUTCHours() * 60 + d.getUTCMinutes();
 }
 
-// 今日幸运槽位（北京时间），范围 0..WINDOW_SLOTS-1
-function getTodayLuckySlot(beijingNow) {
-  return dailyHash(beijingDateStr(beijingNow)) % WINDOW_SLOTS;
+// ========== 随机时间槽（8:00-20:00，每15分钟一个槽） ==========
+
+const WIN_START = 8 * 60;   // 480 (08:00)
+const WIN_END = 20 * 60;    // 1200 (20:00)
+const SLOT = 15;
+const TOTAL_SLOTS = (WIN_END - WIN_START) / SLOT; // 48
+
+function dailySeed(dateStr) {
+  let h = 2166136261;
+  for (const c of dateStr) { h ^= c.charCodeAt(0); h = Math.imul(h, 16777619); }
+  return h >>> 0;
 }
 
-// 当前处于窗口内的第几个槽位；不在窗口内（深夜/凌晨）返回 -1
-function getCurrentSlot(beijingNow) {
-  const mins = beijingNow.getUTCHours() * 60 + beijingNow.getUTCMinutes();
-  if (mins < WINDOW_START_MIN || mins > WINDOW_END_MIN) return -1;
-  return Math.floor((mins - WINDOW_START_MIN) / SLOT_MINUTES);
+function luckySlot(dateStr) {
+  return dailySeed(dateStr) % TOTAL_SLOTS;
 }
 
-// 槽位序号 → 北京时间字符串
-function slotToBeijingTime(slot) {
-  const total = WINDOW_START_MIN + slot * SLOT_MINUTES;
-  const h = Math.floor(total / 60);
-  const m = total % 60;
-  return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
+function slotTime(slot) {
+  const m = WIN_START + slot * SLOT;
+  return `${String(Math.floor(m / 60)).padStart(2, '0')}:${String(m % 60).padStart(2, '0')}`;
 }
 
-// 每天每站最多重试次数（仅失败时计数）；超过则当日放弃，绝不打满"签到次数上限"
-const MAX_ATTEMPTS_PER_DAY = 3;
+// ========== 签到执行 ==========
 
-// ---------- 签到执行 ----------
-
-// 单站点签到封装（带 KV 去重 + 失败重试上限）
-async function checkinSite(name, checkinFn, env, beijingDate) {
+async function doCheckin(env, bjNow) {
+  const date = todayStr(bjNow);
   const kv = env.SIGN_STATE;
-  const signedKey = `signed:${name}:${beijingDate}`;
-  const attemptKey = `attempts:${name}:${beijingDate}`;
+  const results = [];
+  let shouldPush = false;
 
-  // 1) 已签到 / 已被服务端锁定（KV 记录）→ 直接跳过，绝不再调接口
-  if (kv) {
-    const done = await kv.get(signedKey);
-    if (done === 'blocked') {
-      return {
-        site: name,
-        status: 'error',
-        message: '今日账号已被服务端锁定（签到次数超限），明日自动再试',
-        elapsed: '0s',
-        line: `【${name}】🔒今日已被锁定（服务端超限）`,
-        noPush: true,
-      };
-    }
-    if (done) {
-      return {
-        site: name,
-        status: 'already_signed',
-        message: '今日已签到（本地记录）',
-        elapsed: '0s',
-        line: `【${name}】☑️今日已签（本地记录）`,
-      };
-    }
-    // 2) 失败重试已达上限 → 当日放弃，避免打满"签到次数上限"
-    const attempts = Number((await kv.get(attemptKey)) || '0');
-    if (attempts >= MAX_ATTEMPTS_PER_DAY) {
-      return {
-        site: name,
-        status: 'error',
-        message: `今日已尝试 ${attempts} 次仍失败，已达重试上限，今日不再签到（防触发次数超限）`,
-        elapsed: '0s',
-        line: `【${name}】❌今日重试已达上限`,
-        noPush: true,
-      };
-    }
-    await kv.put(attemptKey, String(attempts + 1), { expirationTtl: 172800 });
-  }
-
-  // 3) 真正执行签到
-  const start = Date.now();
-  let result;
-  try {
-    result = await checkinFn(env);
-  } catch (err) {
-    result = { status: 'error', message: err.message };
-  }
-  const elapsed = ((Date.now() - start) / 1000).toFixed(1);
-
-  // 成功后写 KV，确保当天不再重复调用接口
-  if (kv && result.status === 'success') {
-    await kv.put(signedKey, '1', { expirationTtl: 172800 });
-  }
-
-  // 已签（今日已被签，含手动/别处签）也写本地记录，避免每次轮询都消耗"失败重试次数"额度
-  if (kv && result.status === 'already_signed') {
-    await kv.put(signedKey, '1', { expirationTtl: 172800 });
-  }
-
-  // 明确被服务端锁定（签到次数超限）→ 当天彻底放弃，不再重试、不推送
-  const blocked =
-    result.status === 'error' &&
-    /已达上限|次数超限|明天再试|limit/i.test(result.message || '');
-  if (kv && blocked) {
-    await kv.put(signedKey, 'blocked', { expirationTtl: 172800 });
-    result.noPush = true;
-  }
-
-  const emoji =
-    result.status === 'success' ? '✅' : result.status === 'already_signed' ? '☑️' : '❌';
-  const label =
-    result.status === 'success'
-      ? '签到成功'
-      : result.status === 'already_signed'
-        ? '今日已签'
-        : '签到失败';
-  return {
-    site: name,
-    ...result,
-    elapsed: elapsed + 's',
-    line: `【${name}】${emoji}${label}\n${result.message}\n耗时 ${elapsed}s`,
-  };
-}
-
-async function handleCheckin(env, beijingDate) {
-  const tasks = [];
-
-  // 52frp（配置了 FRP_USERNAME 才执行）
+  // ---- 52frp ----
   if (env.FRP_USERNAME) {
-    tasks.push(checkinSite('52frp', runCheckIn, env, beijingDate));
+    const doneKey = `s52:${date}`;
+    const retryKey = `s52r:${date}`;
+    const done = await kv.get(doneKey);
+    const retryAt = await kv.get(retryKey);
+
+    // 已完成或已放弃 → 跳过
+    if (done === 'ok') {
+      results.push({ site: '52frp', status: 'already_signed', message: '今日已签' });
+    } else if (done === 'x') {
+      results.push({ site: '52frp', status: 'error', message: '今日签到失败（已重试），请人工签到' });
+    }
+    // 等待重试中
+    else if (retryAt && Date.now() < Number(retryAt)) {
+      const waitMin = Math.ceil((Number(retryAt) - Date.now()) / 60000);
+      results.push({ site: '52frp', status: 'waiting', message: `等待 ${waitMin} 分钟后重试` });
+    }
+    // 执行签到（首次或重试）
+    else {
+      let result;
+      try {
+        result = await runCheckIn(env);
+      } catch (e) {
+        result = { status: 'error', message: e.message };
+      }
+
+      if (result.status === 'success') {
+        await kv.put(doneKey, 'ok', { expirationTtl: 86400 });
+        results.push({ site: '52frp', status: 'success', message: result.message });
+        shouldPush = true;
+      } else if (result.status === 'already_signed') {
+        await kv.put(doneKey, 'ok', { expirationTtl: 86400 });
+        results.push({ site: '52frp', status: 'already_signed', message: result.message });
+      } else {
+        // 失败处理
+        if (retryAt) {
+          // 这是重试，又失败了 → 放弃
+          await kv.put(doneKey, 'x', { expirationTtl: 86400 });
+          await kv.delete(retryKey);
+          const msg = result.message.includes('已达上限')
+            ? '52frp 签到次数已达上限，明天自动重试'
+            : '52frp 签到失败（已重试），请人工签到';
+          results.push({ site: '52frp', status: 'error', message: msg });
+          shouldPush = true;
+        } else {
+          // 首次失败 → 30 分钟后重试
+          const retryTime = Date.now() + 30 * 60 * 1000;
+          await kv.put(retryKey, String(retryTime), { expirationTtl: 3600 });
+          results.push({
+            site: '52frp',
+            status: 'retry',
+            message: `52frp 签到失败: ${result.message}，将在 30 分钟后重试`,
+          });
+          shouldPush = true;
+        }
+      }
+    }
   }
 
-  // 88frp（主账号 FRP88_USERNAME/FRP88_PASSWORD + 附加账号 FRP88_USERNAME_2/_3…）
-  const frp88Accounts = [];
-  const push88 = (name, username, password) => {
-    if (username && password) frp88Accounts.push({ name, username, password });
-  };
-  push88('88frp', env.FRP88_USERNAME, env.FRP88_PASSWORD);
-  for (let i = 2; i <= 20; i++) {
-    push88(`88frp-${i}`, env[`FRP88_USERNAME_${i}`], env[`FRP88_PASSWORD_${i}`]);
-  }
-  for (const acc of frp88Accounts) {
-    tasks.push(
-      checkinSite(acc.name, (e) => runCheckIn88(e, { username: acc.username, password: acc.password }), env, beijingDate)
-    );
+  // ---- 88frp（主账号 + 附加账号 _2.._5）----
+  const frp88acts = [];
+  if (env.FRP88_USERNAME) frp88acts.push({ label: '88frp', user: env.FRP88_USERNAME, pass: env.FRP88_PASSWORD });
+  for (let i = 2; i <= 5; i++) {
+    const u = env[`FRP88_USERNAME_${i}`];
+    const p = env[`FRP88_PASSWORD_${i}`];
+    if (u && p) frp88acts.push({ label: `88frp-${i}`, user: u, pass: p });
   }
 
-  if (tasks.length === 0) {
-    return {
-      status: 'error',
-      message: '未配置任何签到账号。需要设置 FRP_USERNAME/FRP_PASSWORD（52frp）或 FRP88_USERNAME/FRP88_PASSWORD（88frp）',
-      results: [],
-    };
+  for (const act of frp88acts) {
+    const key = `s88_${act.label}:${date}`;
+    if (await kv.get(key)) {
+      results.push({ site: act.label, status: 'already_signed', message: '今日已签' });
+      continue;
+    }
+    let result;
+    try {
+      result = await runCheckIn88(env, { username: act.user, password: act.pass });
+    } catch (e) {
+      result = { status: 'error', message: e.message };
+    }
+    if (result.status === 'success') {
+      await kv.put(key, '1', { expirationTtl: 86400 });
+      results.push({ site: act.label, status: 'success', message: result.message });
+      shouldPush = true;
+    } else if (result.status === 'already_signed') {
+      await kv.put(key, '1', { expirationTtl: 86400 });
+      results.push({ site: act.label, status: 'already_signed', message: result.message });
+    } else {
+      results.push({ site: act.label, status: 'error', message: result.message });
+      shouldPush = true;
+    }
   }
 
-  // 并行签到所有站点
-  const results = await Promise.all(tasks);
-
-  // 汇总推送
-  const summary = results.map((r) => r.line).join('\n\n');
-  const hasSuccess = results.some((r) => r.status === 'success');
-  // 仅「有新签到成功」或「真实失败（非重试上限提示）」时推送，避免刷屏
-  const hasBlockingError = results.some((r) => r.status === 'error' && !r.noPush);
-  const shouldPush = hasSuccess || hasBlockingError;
-  const title = hasBlockingError ? '签到提醒（有失败）' : '签到完成';
+  // ---- 推送 ----
+  const lines = results.map(r => `【${r.site}】${r.status === 'success' ? '✅' : r.status === 'already_signed' ? '☑️' : r.status === 'waiting' ? '⏳' : r.status === 'retry' ? '🔄' : '❌'} ${r.message}`);
+  const summary = lines.join('\n');
   console.log(summary);
 
-  let pushResult = '本次无新签到（今日已签或无需操作），跳过推送';
+  let pushMsg = '';
   if (shouldPush) {
     try {
-      pushResult = await sendPushPlus(env, title, summary);
+      pushMsg = await sendPushPlus(env, '签到通知', summary);
     } catch (e) {
-      pushResult = '推送失败: ' + e.message;
+      pushMsg = '推送失败: ' + e.message;
     }
   }
 
-  return {
-    status: hasBlockingError ? 'partial' : 'success',
-    results: results.map((r) => ({
-      site: r.site,
-      status: r.status,
-      message: r.message,
-      elapsed: r.elapsed,
-    })),
-    push: pushResult,
-  };
+  return { results, push: pushMsg, summary };
 }
 
-// ---------- Worker 入口 ----------
+// ========== Worker 入口 ==========
 
 export default {
-  // 定时触发：每 15 分钟一次
-  // 随机时间原理（改进版，更稳健）：
-  //   - 基于当天日期算出"幸运时间槽"luckySlot（北京时间 8:00-22:45 内随机，每天不同）
-  //   - 当前时间槽 currentSlot 还没到 luckySlot → 跳过（保证"随机时间点"特性）
-  //   - currentSlot 到达并超过 luckySlot（且仍在 8:00-22:45 窗口内）→ 尝试签到
-  //   - 若当天已签到，runCheckIn 内部会识别 already_signed 直接返回，不会重复签到
-  //   - 若某次网络抖动失败，下一个 15 分钟槽会再次尝试，直到当天签上为至（自动重试）
-  async scheduled(controller, env, ctx) {
-    const bj = getBeijingNow();
-    const luckySlot = getTodayLuckySlot(bj);
-    const currentSlot = getCurrentSlot(bj);
+  async scheduled(_ctrl, env, ctx) {
+    const bj = beijingNow();
+    const mins = timeMin(bj);
+    const date = todayStr(bj);
 
-    // 不在窗口内（深夜/凌晨）→ 跳过，绝不在半夜签到
-    if (currentSlot === -1) {
-      console.log(
-        `[skip] 非签到窗口（北京时间 ${slotToBeijingTime(0)}~${slotToBeijingTime(WINDOW_SLOTS - 1)}），跳过`
-      );
-      return;
-    }
-    // 未到幸运时间 → 跳过
-    if (currentSlot < luckySlot) {
-      console.log(
-        `[skip] 今日幸运时间 ${slotToBeijingTime(luckySlot)}（北京），` +
-        `当前 ${slotToBeijingTime(currentSlot)}，跳过`
-      );
+    // 非窗口时间 → 跳过
+    if (mins < WIN_START || mins > WIN_END) {
+      console.log(`[skip] ${slotTime(0)}前/后，跳过`);
       return;
     }
 
-    console.log(`[run] 已进入今日幸运时间窗口 ${slotToBeijingTime(luckySlot)}（北京），尝试签到`);
-    ctx.waitUntil(handleCheckin(env, beijingDateStr(bj)));
+    // 检查是否已到今天的随机时间槽
+    const slot = luckySlot(date);
+    const currentSlot = Math.floor((mins - WIN_START) / SLOT);
+
+    // 查看是否有待重试
+    const retryAt = await env.SIGN_STATE.get(`s52r:${date}`);
+    const hasRetry = retryAt && Date.now() >= Number(retryAt);
+
+    // 如果没到幸运槽位且没有待重试 → 跳过
+    if (currentSlot < slot && !hasRetry) {
+      console.log(`[skip] 今日签到时间 ${slotTime(slot)}，当前 ${slotTime(currentSlot)}，跳过`);
+      return;
+    }
+
+    // 已过幸运槽位（或到重试时间）→ 执行签到
+    console.log(`[run] 签到时间 ${slotTime(slot)}，当前 ${slotTime(Math.floor(currentSlot))}`);
+    ctx.waitUntil(doCheckin(env, bj));
   },
 
-  // HTTP 手动触发：不受随机时间限制，随时可触发
   async fetch(request, env) {
     const url = new URL(request.url);
 
-    // 只读诊断：北京时间窗口状态 + KV 记录 + 52frp 服务端真实签到状态（不执行签到）
-    // 需要 ACCESS_KEY（若已配置）保护，避免泄露账号状态
-    if (url.pathname === '/state') {
-      if (env.ACCESS_KEY) {
-        const key = url.searchParams.get('key');
-        if (key !== env.ACCESS_KEY) return new Response('Unauthorized', { status: 401 });
-      }
-      const bj = getBeijingNow();
-      const currentSlot = getCurrentSlot(bj);
-      const inWindow = currentSlot !== -1;
-      const date = beijingDateStr(bj);
-      const readKV = async (k) => {
-        try {
-          return (await env.SIGN_STATE.get(k)) || null;
-        } catch {
-          return null;
-        }
-      };
-      const state = {
-        beijingNow: `${date} ${slotToBeijingTime(currentSlot === -1 ? 0 : currentSlot)}`,
-        inWindow,
-        currentSlot,
-        luckySlot: getTodayLuckySlot(bj),
-        luckyTime: slotToBeijingTime(getTodayLuckySlot(bj)),
-        kv: {
-          'signed:52frp': await readKV(`signed:52frp:${date}`),
-          'attempts:52frp': await readKV(`attempts:52frp:${date}`),
-          'signed:88frp': await readKV(`signed:88frp:${date}`),
-          'signed:88frp-2': await readKV(`signed:88frp-2:${date}`),
-        },
-      };
-      try {
-        state.frp52ServerStatus = await getStatus52(env);
-      } catch (e) {
-        state.frp52ServerStatus = { error: e.message };
-      }
-      return new Response(JSON.stringify(state, null, 2), {
-        headers: { 'Content-Type': 'application/json; charset=utf-8' },
-      });
-    }
-
-    // 受控探针：对 52frp 真实签到一次，原样返回每步原始报文（用于排查拒签根因）。
-    // 需要 ACCESS_KEY 保护；绕过 KV 预算，仅单次。
-    if (url.pathname === '/probe') {
-      if (env.ACCESS_KEY) {
-        const key = url.searchParams.get('key');
-        if (key !== env.ACCESS_KEY) return new Response('Unauthorized', { status: 401 });
-      }
-      const probe = await probeSign52(env);
-      return new Response(JSON.stringify(probe, null, 2), {
-        headers: { 'Content-Type': 'application/json; charset=utf-8' },
-      });
-    }
-
-    // 可选鉴权：配置了 ACCESS_KEY 时，/run 需要 ?key=xxx
-    if (env.ACCESS_KEY) {
-      const key = url.searchParams.get('key');
-      if (key !== env.ACCESS_KEY) {
-        return new Response('Unauthorized', { status: 401 });
-      }
-    }
-
+    // 手动触发签到
     if (url.pathname === '/run' || url.pathname === '/') {
-      const bj = getBeijingNow();
-      const currentSlot = getCurrentSlot(bj);
-      const inWindow = currentSlot !== -1;
-      const force = url.searchParams.get('force') === '1';
-      // 关键修复：/run 与 / 不再全天候可签到。非窗口内（深夜/凌晨）默认跳过，
-      // 避免公网/机器人/误触在半夜触发签到（这正是"半夜在签到"的源头）。
-      // 仅在配置了 ?force=1 时允许强制（且已被上面的 ACCESS_KEY 保护）。
-      if (!inWindow && !force) {
-        return new Response(
-          JSON.stringify(
-            {
-              skipped: true,
-              reason: '非签到窗口（北京 8:00-22:45），/run 已限制窗口内才签到；如需强制请使用 ?force=1（需 ACCESS_KEY）',
-              beijingNow: `${beijingDateStr(bj)} ${slotToBeijingTime(currentSlot === -1 ? 0 : currentSlot)}`,
-              inWindow: false,
-            },
-            null,
-            2
-          ),
-          { headers: { 'Content-Type': 'application/json; charset=utf-8' } }
-        );
+      const bj = beijingNow();
+      const mins = timeMin(bj);
+      if (mins < WIN_START || mins > WIN_END) {
+        return new Response(JSON.stringify({ skipped: true, reason: `非签到窗口（${slotTime(0)}-${slotTime(TOTAL_SLOTS - 1)}）` }), {
+          headers: { 'Content-Type': 'application/json; charset=utf-8' },
+        });
       }
-      const luckySlot = getTodayLuckySlot(bj);
-      const result = await handleCheckin(env, beijingDateStr(bj));
-      result.luckyTime = slotToBeijingTime(luckySlot);
+      const result = await doCheckin(env, bj);
       return new Response(JSON.stringify(result, null, 2), {
         headers: { 'Content-Type': 'application/json; charset=utf-8' },
       });
     }
 
-    // 查看今日幸运时间（不执行签到）
+    // 查看今日签到时间
     if (url.pathname === '/lucky') {
-      const bj = getBeijingNow();
-      const luckySlot = getTodayLuckySlot(bj);
-      const currentSlot = getCurrentSlot(bj);
-      return new Response(
-        JSON.stringify({
-          date: beijingDateStr(bj),
-          luckyTimeBeijing: slotToBeijingTime(luckySlot),
-          currentTimeBeijing: currentSlot === -1 ? '非窗口' : slotToBeijingTime(currentSlot),
-        }, null, 2),
-        { headers: { 'Content-Type': 'application/json; charset=utf-8' } }
-      );
+      const bj = beijingNow();
+      const s = luckySlot(todayStr(bj));
+      return new Response(JSON.stringify({
+        date: todayStr(bj),
+        time: slotTime(s),
+        window: `${slotTime(0)}-${slotTime(TOTAL_SLOTS - 1)}`,
+      }), { headers: { 'Content-Type': 'application/json; charset=utf-8' } });
     }
 
-    return new Response(
-      'FRP 自动签到 Worker\n' +
-      '支持站点: 52frp.com / 88frp.com\n\n' +
-      'GET /run   手动触发签到（签到所有已配置站点）\n' +
-      'GET /lucky 查看今日随机幸运时间\n',
-      { headers: { 'Content-Type': 'text/plain; charset=utf-8' } }
-    );
+    return new Response('FRP签到\n/run 手动签到\n/lucky 查看签到时间', {
+      headers: { 'Content-Type': 'text/plain; charset=utf-8' },
+    });
   },
 };
