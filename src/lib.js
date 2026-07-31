@@ -189,7 +189,10 @@ function createApiClient() {
       }
     }
     if (!res.ok || isPayloadFailure(payload)) {
-      throw new Error(extractMessage(payload, `请求失败 (${res.status})`));
+      const err = new Error(extractMessage(payload, `请求失败 (${res.status})`));
+      err.payload = payload;
+      err.status = res.status;
+      throw err;
     }
     return payload;
   }
@@ -299,6 +302,114 @@ export async function runCheckIn(env) {
     message: buildSuccessMessage(finalInfo, rewardBytes, userInfo),
     details: { ...finalInfo, rewardBytes, userInfo },
   };
+}
+
+// ---------------- 只读状态查询（不执行签到 POST） ----------------
+// 仅登录 + 读取 /sign/info，用于排查 52frp 当前服务端状态（是否已签 / 是否被锁），
+// 绝不会调用 POST /sign，因此不构成"尝试签到"。
+
+export async function getStatus52(env) {
+  if (!env.FRP_USERNAME || !env.FRP_PASSWORD) {
+    return { ok: false, error: '缺少 FRP_USERNAME / FRP_PASSWORD' };
+  }
+  const api = createApiClient();
+  const creds = { username: env.FRP_USERNAME, password: env.FRP_PASSWORD };
+  try {
+    const loginRes = await api.login(creds);
+    const authToken = extractLoginToken(loginRes);
+    if (!authToken) {
+      return { ok: true, loginOk: true, tokenPresent: false, note: '登录成功但未拿到 token（可能触发登录滑块，纯 API 无法处理）' };
+    }
+    api.setToken(authToken);
+    const infoRaw = await api.getSignInfo();
+    const info = normalizeSignInfo(infoRaw);
+    return {
+      ok: true,
+      loginOk: true,
+      tokenPresent: true,
+      signedToday: info.signedToday,
+      totalSignDays: info.totalSignDays,
+      signInfoRaw: infoRaw,
+    };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+}
+
+// ---------------- 受控探针（真实签到一次，原样返回每步原始报文） ----------------
+// 用于排查 52frp 究竟为何拒签：是 429 限流、滑块被静默拒绝、还是其他。
+// 仅单次、受 ACCESS_KEY 保护，不做 KV 去重/重试。
+
+export async function probeSign52(env) {
+  if (!env.FRP_USERNAME || !env.FRP_PASSWORD) {
+    return { ok: false, error: '缺少 FRP_USERNAME / FRP_PASSWORD' };
+  }
+  const api = createApiClient();
+  const creds = { username: env.FRP_USERNAME, password: env.FRP_PASSWORD };
+  const out = {};
+  try {
+    out.rawLogin = await api.login(creds);
+    const authToken = extractLoginToken(out.rawLogin);
+    out.tokenPresent = !!authToken;
+    if (!authToken) {
+      out.ok = false;
+      out.status = 'error';
+      out.message = '登录成功但未拿到 token（可能触发登录滑块）';
+      return out;
+    }
+    api.setToken(authToken);
+
+    out.rawSignInfoBefore = await api.getSignInfo();
+    const before = normalizeSignInfo(out.rawSignInfoBefore);
+    out.signedTodayBefore = before.signedToday;
+    if (before.signedToday) {
+      out.ok = true;
+      out.status = 'already_signed';
+      out.message = '服务端显示今日已签';
+      return out;
+    }
+
+    out.rawSlider = await api.getSignSliderToken();
+    const sliderToken = extractSliderToken(out.rawSlider);
+    out.sliderTokenPresent = !!sliderToken;
+    if (!sliderToken) {
+      out.ok = false;
+      out.status = 'error';
+      out.message = '未拿到 slider_token';
+      return out;
+    }
+
+    try {
+      out.rawSign = await api.signIn(sliderToken);
+    } catch (e) {
+      out.signError = e.message;
+      out.signErrorPayload = e.payload ?? null;
+      out.signErrorStatus = e.status ?? null;
+      out.ok = false;
+      out.status = 'error';
+      out.message = `POST /sign 被服务端拒绝：${e.message}`;
+      return out;
+    }
+    out.signRateLimited = isRateLimited(out.rawSign);
+
+    out.rawSignInfoAfter = await api.getSignInfo();
+    const after = normalizeSignInfo(out.rawSignInfoAfter);
+    out.signedTodayAfter = after.signedToday;
+    if (after.signedToday) {
+      out.ok = true;
+      out.status = 'success';
+      out.message = 'POST /sign 成功且服务端确认已签（纯 API 可用）';
+    } else {
+      out.ok = false;
+      out.status = 'error';
+      out.message = 'POST /sign 返回成功，但服务端仍显示未签到（高度疑似要求真人滑块拖拽，纯 API 被静默拒绝）';
+    }
+  } catch (e) {
+    out.ok = false;
+    out.status = 'error';
+    out.message = e.message;
+  }
+  return out;
 }
 
 // ---------------- PushPlus 推送 ----------------

@@ -17,7 +17,7 @@
 //          + 附加账号 FRP88_USERNAME_2 / FRP88_PASSWORD_2、FRP88_USERNAME_3 / FRP88_PASSWORD_3 …（最多 _20）
 //   未配置某站点的账号密码时自动跳过该站点
 
-import { runCheckIn, sendPushPlus } from './lib.js';
+import { runCheckIn, sendPushPlus, getStatus52, probeSign52 } from './lib.js';
 import { runCheckIn88 } from './frp88.js';
 
 // ---------- 北京时间 & 随机时间槽 ----------
@@ -265,6 +265,60 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
 
+    // 只读诊断：北京时间窗口状态 + KV 记录 + 52frp 服务端真实签到状态（不执行签到）
+    // 需要 ACCESS_KEY（若已配置）保护，避免泄露账号状态
+    if (url.pathname === '/state') {
+      if (env.ACCESS_KEY) {
+        const key = url.searchParams.get('key');
+        if (key !== env.ACCESS_KEY) return new Response('Unauthorized', { status: 401 });
+      }
+      const bj = getBeijingNow();
+      const currentSlot = getCurrentSlot(bj);
+      const inWindow = currentSlot !== -1;
+      const date = beijingDateStr(bj);
+      const readKV = async (k) => {
+        try {
+          return (await env.SIGN_STATE.get(k)) || null;
+        } catch {
+          return null;
+        }
+      };
+      const state = {
+        beijingNow: `${date} ${slotToBeijingTime(currentSlot === -1 ? 0 : currentSlot)}`,
+        inWindow,
+        currentSlot,
+        luckySlot: getTodayLuckySlot(bj),
+        luckyTime: slotToBeijingTime(getTodayLuckySlot(bj)),
+        kv: {
+          'signed:52frp': await readKV(`signed:52frp:${date}`),
+          'attempts:52frp': await readKV(`attempts:52frp:${date}`),
+          'signed:88frp': await readKV(`signed:88frp:${date}`),
+          'signed:88frp-2': await readKV(`signed:88frp-2:${date}`),
+        },
+      };
+      try {
+        state.frp52ServerStatus = await getStatus52(env);
+      } catch (e) {
+        state.frp52ServerStatus = { error: e.message };
+      }
+      return new Response(JSON.stringify(state, null, 2), {
+        headers: { 'Content-Type': 'application/json; charset=utf-8' },
+      });
+    }
+
+    // 受控探针：对 52frp 真实签到一次，原样返回每步原始报文（用于排查拒签根因）。
+    // 需要 ACCESS_KEY 保护；绕过 KV 预算，仅单次。
+    if (url.pathname === '/probe') {
+      if (env.ACCESS_KEY) {
+        const key = url.searchParams.get('key');
+        if (key !== env.ACCESS_KEY) return new Response('Unauthorized', { status: 401 });
+      }
+      const probe = await probeSign52(env);
+      return new Response(JSON.stringify(probe, null, 2), {
+        headers: { 'Content-Type': 'application/json; charset=utf-8' },
+      });
+    }
+
     // 可选鉴权：配置了 ACCESS_KEY 时，/run 需要 ?key=xxx
     if (env.ACCESS_KEY) {
       const key = url.searchParams.get('key');
@@ -275,6 +329,27 @@ export default {
 
     if (url.pathname === '/run' || url.pathname === '/') {
       const bj = getBeijingNow();
+      const currentSlot = getCurrentSlot(bj);
+      const inWindow = currentSlot !== -1;
+      const force = url.searchParams.get('force') === '1';
+      // 关键修复：/run 与 / 不再全天候可签到。非窗口内（深夜/凌晨）默认跳过，
+      // 避免公网/机器人/误触在半夜触发签到（这正是"半夜在签到"的源头）。
+      // 仅在配置了 ?force=1 时允许强制（且已被上面的 ACCESS_KEY 保护）。
+      if (!inWindow && !force) {
+        return new Response(
+          JSON.stringify(
+            {
+              skipped: true,
+              reason: '非签到窗口（北京 8:00-22:45），/run 已限制窗口内才签到；如需强制请使用 ?force=1（需 ACCESS_KEY）',
+              beijingNow: `${beijingDateStr(bj)} ${slotToBeijingTime(currentSlot === -1 ? 0 : currentSlot)}`,
+              inWindow: false,
+            },
+            null,
+            2
+          ),
+          { headers: { 'Content-Type': 'application/json; charset=utf-8' } }
+        );
+      }
       const luckySlot = getTodayLuckySlot(bj);
       const result = await handleCheckin(env, beijingDateStr(bj));
       result.luckyTime = slotToBeijingTime(luckySlot);
