@@ -48,7 +48,14 @@ function api() {
   const jar = new Map();
 
   const hdrs = (extra = {}) => {
-    const h = { 'User-Agent': UA, Accept: 'application/json, text/plain, */*', ...extra };
+    const h = {
+      'User-Agent': UA,
+      Accept: 'application/json, text/plain, */*',
+      'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+      Origin: 'https://www.52frp.com',
+      Referer: PANEL,
+      ...extra,
+    };
     if (token) h.Authorization = `Bearer ${token}`;
     if (jar.size) h.Cookie = [...jar].map(([k, v]) => `${k}=${v}`).join('; ');
     return h;
