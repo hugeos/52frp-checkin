@@ -45,6 +45,7 @@ function bytes(v) {
 
 function api() {
   let token = '';
+  let csrf = '';
   const jar = new Map();
 
   const hdrs = (extra = {}) => {
@@ -57,6 +58,7 @@ function api() {
       ...extra,
     };
     if (token) h.Authorization = `Bearer ${token}`;
+    if (csrf) h['X-CSRF-Token'] = csrf;
     if (jar.size) h.Cookie = [...jar].map(([k, v]) => `${k}=${v}`).join('; ');
     return h;
   };
@@ -68,7 +70,13 @@ function api() {
     for (const c of sc) {
       const p = String(c).split(';')[0];
       const i = p.indexOf('=');
-      if (i > 0) jar.set(p.slice(0, i).trim(), p.slice(i + 1).trim());
+      if (i > 0) {
+        const k = p.slice(0, i).trim();
+        const v = p.slice(i + 1).trim();
+        jar.set(k, v);
+        // 52frp 登录后下发的 CSRF token（POST 必须带 X-CSRF-Token 头，否则 400）
+        if (k === 'hzfrp_user_csrf') csrf = v;
+      }
     }
   };
 
