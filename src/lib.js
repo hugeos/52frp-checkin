@@ -1,9 +1,10 @@
 // 52frp 自动签到（纯 API）
 // 链路：GET /user/ → POST /user/login → GET /user/sign/info → GET /user/slider-token → POST /user/sign
+// 注意：52frp 有反爬请求特征校验（TLS 指纹 + 请求头组合），纯 API 请求必须尽量模拟真实 Chrome 请求头。
 
 const BASE = 'https://www.52frp.com/api';
 const PANEL = 'https://www.52frp.com/user/';
-const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126.0.0.0 Safari/537.36';
+const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36';
 
 // ---- 工具 ----
 
@@ -53,6 +54,14 @@ function api() {
       'User-Agent': UA,
       Accept: 'application/json, text/plain, */*',
       'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+      'Accept-Encoding': 'gzip, deflate, br, zstd',
+      'Sec-Ch-Ua': '"Not;A=Brand";v="8", "Chromium";v="150", "Google Chrome";v="150"',
+      'Sec-Ch-Ua-Mobile': '?0',
+      'Sec-Ch-Ua-Platform': '"Windows"',
+      'Sec-Fetch-Dest': 'empty',
+      'Sec-Fetch-Mode': 'cors',
+      'Sec-Fetch-Site': 'same-origin',
+      Priority: 'u=1, i',
       Origin: 'https://www.52frp.com',
       Referer: PANEL,
       ...extra,
@@ -138,9 +147,13 @@ export async function runCheckIn(env) {
     return { status: 'already_signed', message: `52frp 今日已签（连续${days}天，剩余${remain}）` };
   }
 
-  // 3. 滑块 token
-  const st = unwrap(await a.slider());
-  const sToken = unwrap(st)?.token || st?.token || '';
+  // 3. 滑块 token（浏览器实测会连续获取两次、用最后一次，尽量贴近）
+  let sToken = '';
+  for (let i = 0; i < 2; i++) {
+    const st = unwrap(await a.slider());
+    const tk = unwrap(st)?.token || st?.token || '';
+    if (tk) sToken = tk;
+  }
   if (!sToken) throw new Error('未拿到 slider_token');
 
   // 4. 签到
